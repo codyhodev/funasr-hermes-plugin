@@ -172,8 +172,32 @@ def main(socket_path: str | None = None) -> None:
             elif action == "transcribe":
                 file_path = request["file_path"]
                 t1 = time.time()
+
+                # ── Noise reduction via ffmpeg ────────────────────────
+                nr_path = file_path + ".nr.wav"
+                try:
+                    import subprocess as _sp
+                    _sp.run(
+                        ["ffmpeg", "-y",
+                         "-i", file_path,
+                         "-af", "highpass=f=200,lowpass=f=4000,afftdn=nr=15:nf=-30",
+                         nr_path],
+                        capture_output=True, timeout=30,
+                    )
+                    if os.path.getsize(nr_path) > 0:
+                        file_path = nr_path
+                except Exception as _nr_err:
+                    logger.debug("Noise reduction skipped: %s", _nr_err)
+
                 with _SilenceStderr():
                     result = model.generate(input=file_path)
+
+                # Clean up temp file
+                if nr_path != file_path and os.path.exists(nr_path):
+                    try:
+                        os.unlink(nr_path)
+                    except OSError:
+                        pass
 
                 # Parse SenseVoice output
                 raw_text = ""
