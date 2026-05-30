@@ -53,79 +53,28 @@ class _SilenceStderr:
             sys.stderr = self._stderr
 
 
-# ── VAD-based punctuation inference ────────────────────────────────
-_VAD_MODEL = None
+# ── Punctuation restoration (FunASR ct-punc model) ──────────────────
+_PUNC_MODEL = None
+_PUNC_MODEL_NAME = "iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch"
 
 
-def _punctuate_with_vad(text: str, audio_path: str) -> str:
-    """Add punctuation by analyzing pause durations with VAD.
+def _punctuate_with_model(text: str) -> str:
+    """Restore punctuation using FunASR's ct-punc model.
 
-    Detects speech/silence segments in the audio, maps gap durations
-    to punctuation marks, and inserts them at proportional positions
-    in the transcript.
-
-    Falls back to raw text if silero-vad is unavailable.
+    Unlike the old VAD-based approach that infers punctuation from
+    audio pause durations, this uses a dedicated punctuation model
+    that understands sentence semantics — much more accurate.
     """
-    if not text.strip():
+    if not text.strip() or _PUNC_MODEL is None:
         return text
 
-    global _VAD_MODEL
     try:
-        if _VAD_MODEL is None:
-            from silero_vad import load_silero_vad
-            _VAD_MODEL = load_silero_vad()
-
-        import soundfile as sf
-
-        audio, sr = sf.read(audio_path)
-        if len(audio.shape) > 1:
-            audio = audio.mean(axis=1)  # mono
-
-        stamps = _VAD_MODEL.get_speech_timestamps(audio, sr)
-        if len(stamps) <= 1:
-            return text  # no pauses to infer from
-
-        # Gap durations (seconds) between consecutive speech segments
-        gaps = []
-        for i in range(len(stamps) - 1):
-            gap = (stamps[i + 1]["start"] - stamps[i]["end"]) / sr
-            gaps.append(gap)
-
-        # Classify each gap → Chinese punctuation mark
-        punct = []
-        for g in gaps:
-            if g < 0.25:
-                punct.append(None)       # brief pause, keep flowing
-            elif g < 0.6:
-                punct.append("，")        # short pause → comma
-            else:
-                punct.append("。")        # long pause → period
-
-        # Proportional text split by segment duration
-        total_s = sum(s["end"] - s["start"] for s in stamps)
-        ratios = [(s["end"] - s["start"]) / total_s for s in stamps]
-
-        n_chars = len(text)
-        pos = 0
-        parts = []
-        for i, r in enumerate(ratios):
-            n = n_chars - pos if i == len(ratios) - 1 else max(1, int(n_chars * r))
-            parts.append(text[pos : pos + n])
-            pos += n
-            if i < len(punct) and punct[i] is not None:
-                parts.append(punct[i])
-
-        result = "".join(parts)
-        # Ensure it ends with sentence-ending punctuation
-        if result and result[-1] not in "。！？；":
-            result += "。"
-        return result
-
-    except ImportError:
-        logger.debug("silero-vad not installed — skipping punctuation")
+        result = _PUNC_MODEL.generate(input=text)
+        if isinstance(result, list) and len(result) > 0:
+            return result[0].get("text", text)
         return text
     except Exception as exc:
-        logger.warning("VAD punctuation failed: %s", exc)
+        logger.warning("Punctuation model failed: %s", exc)
         return text
 
 
@@ -162,6 +111,19 @@ def main(socket_path: str | None = None) -> None:
     load_time = time.time() - t0
     logger.info("Model loaded in %.1fs on %s — listening",
                 load_time, "GPU" if torch.cuda.is_available() else "CPU")
+
+    # ── Load punctuation restoration model ─────────────────────────
+    global _PUNC_MODEL
+    t1 = time.time()
+    logger.info("Loading punctuation model %s…", _PUNC_MODEL_NAME)
+    with _SilenceStderr():
+        _PUNC_MODEL = AutoModel(
+            model=_PUNC_MODEL_NAME,
+            device="cuda:0" if torch.cuda.is_available() else "cpu",
+            disable_update=True,
+            disable_pipeline=True,
+        )
+    logger.info("Punctuation model loaded in %.1fs", time.time() - t1)
 
     # ── Unix socket server ───────────────────────────────────────────
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -224,7 +186,7 @@ def main(socket_path: str | None = None) -> None:
                 clean_text = re.sub(r"<\|[^|]+\|>", "", raw_text).strip()
 
                 # VAD-based punctuation inference
-                clean_text = _punctuate_with_vad(clean_text, file_path)
+                clean_text = _punctuate_with_model(clean_text)
 
                 elapsed = time.time() - t1
                 logger.info("Transcribed in %.3fs", elapsed)
